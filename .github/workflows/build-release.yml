@@ -1,0 +1,87 @@
+name: Build node bundle
+
+# Keeps the downloadable node bundle fresh with zero manual work:
+# every Monday it checks the upstream Lavalink / plugin releases, and if
+# anything changed it rebuilds freemium-node.zip and publishes a GitHub
+# Release. The dashboard + wizard link the stable
+#   .../releases/latest/download/freemium-node.zip
+# URL, so users always get the newest bundle with no link changes.
+
+on:
+  schedule:
+    - cron: "0 4 * * 1" # Mondays 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Publish a release even if upstream versions are unchanged"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write # needed to create releases
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build bundle
+        run: python3 scripts/build_bundle.py --out dist/
+
+      - name: Read built versions
+        id: versions
+        run: |
+          echo "json=$(jq -c . dist/versions.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Get latest release versions
+        id: current
+        run: |
+          TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || echo "none")
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ "$TAG" != "none" ]; then
+            gh release download "$TAG" -p versions.json -D /tmp/prev 2>/dev/null || true
+            if [ -f /tmp/prev/versions.json ]; then
+              echo "json=$(jq -c . /tmp/prev/versions.json)" >> "$GITHUB_OUTPUT"
+            else
+              echo "json={}" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "json={}" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether to release
+        id: decide
+        run: |
+          NEW='${{ steps.versions.outputs.json }}'
+          OLD='${{ steps.current.outputs.json }}'
+          FORCE='${{ inputs.force }}'
+          if [ "$FORCE" = "true" ] || [ "$NEW" != "$OLD" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            LAVATAG=$(echo "$NEW" | jq -r .lavalink.tag)
+            DATE=$(date +%Y%m%d)
+            echo "tag=node-${LAVATAG#v}-${DATE}" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish release
+        if: steps.decide.outputs.release == 'true'
+        run: |
+          TAG='${{ steps.decide.outputs.tag }}'
+          NOTES=$(python3 - <<'EOF'
+          import json
+          v = json.load(open('dist/versions.json'))
+          lines = ["FreeMium JayRain audio node bundle — everything in one download.", ""]
+          for key, info in v.items():
+              lines.append(f"- {info['repo']} {info['tag']} ({info['asset']})")
+          lines += ["", "Unzip, double-click the start script, choose a node password, done."]
+          print("\n".join(lines))
+          EOF
+          )
+          gh release create "$TAG" dist/freemium-node.zip dist/versions.json \
+            --title "Node bundle $TAG" --notes "$NOTES"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
